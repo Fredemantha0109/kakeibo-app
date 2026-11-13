@@ -801,6 +801,7 @@
     <button class="nav-tab" onclick="showPage('input', this)">✏️ 月次入力</button>
     <button class="nav-tab" onclick="showPage('bulk', this)">📅 過去一括入力</button>
     <button class="nav-tab" onclick="showPage('fixed', this)">🧾 固定費</button>
+    <button class="nav-tab" onclick="showPage('family', this)">💳 家族カード</button>
     <button class="nav-tab" onclick="showPage('settings', this)">⚙️ 設定</button>
   </div>
   <div class="nav-status" id="navStatus">読み込み中...</div>
@@ -808,7 +809,7 @@
 
 <div id="bottomNav">
   <button class="bottom-tab active" onclick="showPage('dashboard', this)">
-    <span class="tab-icon">📊</span>ダッシュボード
+    <span class="tab-icon">📊</span>ホーム
   </button>
   <button class="bottom-tab" onclick="showPage('input', this)">
     <span class="tab-icon">✏️</span>月次入力
@@ -818,6 +819,9 @@
   </button>
   <button class="bottom-tab" onclick="showPage('fixed', this)">
     <span class="tab-icon">🧾</span>固定費
+  </button>
+  <button class="bottom-tab" onclick="showPage('family', this)">
+    <span class="tab-icon">💳</span>家族カード
   </button>
   <button class="bottom-tab" onclick="showPage('settings', this)">
     <span class="tab-icon">⚙️</span>設定
@@ -910,6 +914,16 @@
     </div>
   </div>
 
+  <!-- 家族カード（締め月ごとの利用額。表示のみ） -->
+  <div id="page-family" class="page">
+    <div class="card">
+      <div class="card-title">家族カードの利用額</div>
+      <div id="familyContent">
+        <div class="loading"><div class="spinner"></div>読み込み中...</div>
+      </div>
+    </div>
+  </div>
+
   <!-- 設定 -->
   <div id="page-settings" class="page">
     <div class="card">
@@ -967,7 +981,7 @@ function renderBulkForm() {
   const monthBalances = allBalances[bulkMonth] || {};
 
   // 固定費はこの画面には出さない（専用の「固定費」タブで年グリッドから入力する）
-  const assetAccs = accounts.filter(a => !isFixedCostAccount(a));
+  const assetAccs = accounts.filter(isMonthlyInputAccount);
 
   const renderRow = (acc) => {
     const raw = monthBalances[acc.name]?.amount;
@@ -1329,6 +1343,15 @@ function isCifAccount(acc) { return typeLabel(acc) === CIF_TYPE; }
 const FIXED_COST_TYPE = '固定費';
 function isFixedCostAccount(acc) { return typeLabel(acc) === FIXED_COST_TYPE; }
 
+// 家族カードの利用額（締め月ごと）。月次残高DBに「年月=締め日の月」で記録する。
+// 支出の記録なので、固定費と同じく総資産・内訳・グラフ・月次入力のすべてから除外する。
+// 金額は毎月25日の定期タスクが明細PDFから集計して書き込む。この画面は表示だけ。
+const FAMILY_CARD_TYPE = '家族カード';
+function isFamilyCardAccount(acc) { return typeLabel(acc) === FAMILY_CARD_TYPE; }
+
+// 月次入力・過去一括入力に出さない種別（それぞれ専用タブで扱う）
+function isMonthlyInputAccount(acc) { return !isFixedCostAccount(acc) && !isFamilyCardAccount(acc); }
+
 // 負債（住宅ローン・自動車ローンなど）。残高はマイナスで記録する。
 // 資産ではないので総資産・オーナー別内訳・資産種別内訳・各グラフからは除外し、
 // ダッシュボード下部の専用カードだけで「負債」と「純資産」を表示する。
@@ -1340,11 +1363,11 @@ function isNegativeInputAccount(acc) { return isCofAccount(acc) || isLiabilityAc
 
 // 総資産・オーナー別内訳・資産種別内訳・総資産推移グラフから除外する種別。
 // 見込COF/CIFは「総資産に織り込む」ものなので除外しない。固定費と負債がここに入る。
-const EXCLUDED_TOTAL_TYPES = [FIXED_COST_TYPE, LIABILITY_TYPE];
+const EXCLUDED_TOTAL_TYPES = [FIXED_COST_TYPE, LIABILITY_TYPE, FAMILY_CARD_TYPE];
 function isCountedInTotal(acc) { return !EXCLUDED_TOTAL_TYPES.includes(typeLabel(acc)); }
 
 // 資産種別の推移グラフから除外する種別（見込COF/CIFはカード集計には含める）
-const EXCLUDED_TREND_TYPES = [COF_TYPE, CIF_TYPE, FIXED_COST_TYPE, LIABILITY_TYPE];
+const EXCLUDED_TREND_TYPES = [COF_TYPE, CIF_TYPE, FIXED_COST_TYPE, LIABILITY_TYPE, FAMILY_CARD_TYPE];
 
 // 全月・全種別の推移データを返す。
 // 戻り値: { months: ['2026-01',...], types: ['預金',...], series: { '預金': [数値,...] } }
@@ -1946,7 +1969,7 @@ function renderInputForm() {
   const prefillBalances = prefillMonth ? (allBalances[prefillMonth] || {}) : {};
 
   // 固定費はこの画面には出さない（専用の「固定費」タブで年グリッドから入力する）
-  const assetAccs = accounts.filter(a => !isFixedCostAccount(a));
+  const assetAccs = accounts.filter(isMonthlyInputAccount);
 
   const renderRow = (acc) => {
     const current = monthBalances[acc.name]?.amount;
@@ -2255,6 +2278,114 @@ async function retrySave() {
     showSaveErrors('inputErrorBox', job.ym, failed, 'retrySave()');
   }
   await loadAll();
+}
+
+// ===== 家族カード（締め月ごとの利用額。表示のみ） =====
+let familyCardChartInstance = null;
+
+// 支出の増減バッジ。資産と逆で、増えたら赤・減ったら緑にする。
+// withPct=false で率を省く（スマホ幅の表で列がはみ出さないように）
+function renderSpendDelta(cur, prev, withPct = true) {
+  const diff = cur - prev;
+  const sign = diff > 0 ? '+' : '';
+  const cls = diff > 0 ? 'delta-down' : diff < 0 ? 'delta-up' : 'delta-flat';
+  const pct = withPct && prev !== 0 ? ` (${sign}${((diff / Math.abs(prev)) * 100).toFixed(1)}%)` : '';
+  return `<span class="delta ${cls}">${sign}${fmtYen(diff)}${pct}</span>`;
+}
+
+function renderFamilyCard() {
+  const box = document.getElementById('familyContent');
+  familyCardChartInstance?.destroy();
+  familyCardChartInstance = null;
+
+  const accs = accounts.filter(isFamilyCardAccount);
+  if (accs.length === 0) {
+    box.innerHTML = `
+      <div class="fc-note">
+        口座マスタに資産種別「${FAMILY_CARD_TYPE}」の有効な項目がありません。
+      </div>`;
+    return;
+  }
+
+  // 締め月（年月）ごとに、家族カードの口座の金額を合計する
+  const rows = Object.keys(allBalances)
+    .filter(ym => /^\d{4}-\d{2}$/.test(ym))
+    .sort()
+    .map(ym => ({
+      ym,
+      amount: accs.reduce((s, acc) => s + (allBalances[ym]?.[acc.name]?.amount || 0), 0),
+      recorded: accs.some(acc => allBalances[ym]?.[acc.name] !== undefined)
+    }))
+    .filter(r => r.recorded);
+
+  if (rows.length === 0) {
+    box.innerHTML = `<div class="fc-note">まだ記録がありません。毎月25日の定期タスクが、明細の締め月ごとに書き込みます。</div>`;
+    return;
+  }
+
+  const latest = rows[rows.length - 1];
+  const before = rows.slice(0, -1);
+  const avg = before.length ? before.reduce((s, r) => s + r.amount, 0) / before.length : null;
+  const avgLine = avg === null
+    ? '<span class="delta delta-flat">比べる過去の月はまだありません</span>'
+    : `<span style="font-size:12px; color:var(--text2);">それまでの平均 ${fmtYen(avg)}</span>　${renderSpendDelta(latest.amount, avg)}`;
+
+  const tableRows = rows.slice().reverse().map((r, i, arr) => {
+    const prev = arr[i + 1];
+    return `
+      <tr>
+        <td class="fc-item">${r.ym.replace('-', '年')}月締め</td>
+        <td class="fc-num">${fmtYen(r.amount)}</td>
+        <td class="fc-num">${prev ? renderSpendDelta(r.amount, prev.amount, false) : '—'}</td>
+      </tr>`;
+  }).join('');
+
+  box.innerHTML = `
+    <div class="fc-note">
+      明細の締め月（毎月21日締め）ごとの、家族カードの利用額です。
+      支出の記録なので、<strong>総資産・内訳・グラフには含めていません</strong>。
+    </div>
+    <div class="owner-row">
+      <div class="owner-name">${latest.ym.replace('-', '年')}月締め</div>
+      <div style="text-align:right;">
+        <div class="owner-amount">${fmtYen(latest.amount)}</div>
+        <div>${avgLine}</div>
+      </div>
+    </div>
+    <div class="chart-container fc-chart" style="margin-top:16px;">
+      <canvas id="familyCardChart"></canvas>
+    </div>
+    <div class="fc-table-wrap">
+      <table class="fc-table">
+        <thead><tr><th class="fc-item">締め月</th><th>利用額</th><th>前月比</th></tr></thead>
+        <tbody>${tableRows}</tbody>
+      </table>
+    </div>
+  `;
+
+  familyCardChartInstance = new Chart(document.getElementById('familyCardChart').getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.ym),
+      datasets: [{ label: '利用額', data: rows.map(r => r.amount), backgroundColor: typeColor(0), borderWidth: 0 }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ` ${fmtYen(ctx.raw)}` } }
+      },
+      scales: {
+        x: { ticks: { color: '#5a6190' }, grid: { display: false } },
+        y: {
+          beginAtZero: true,
+          ticks: { color: '#5a6190', callback: v => fmtYenShort(v) },
+          grid: { color: 'rgba(46,50,80,0.5)' }
+        }
+      }
+    }
+  });
 }
 
 // ===== 固定費の入力（年グリッド） =====
@@ -2626,6 +2757,7 @@ function showPage(name, el) {
   if (name === 'input') renderInputForm();
   if (name === 'bulk') renderBulkForm();
   if (name === 'fixed') renderFixedForm();
+  if (name === 'family') renderFamilyCard();
   if (name === 'settings') {
     updateAppKeyDisplay();
     document.getElementById('targetInput').value = targetAmount;
